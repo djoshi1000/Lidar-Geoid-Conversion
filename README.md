@@ -437,7 +437,7 @@ Developed by Durga Joshi for LiDAR geoid/CRS conversion and QA workflows.
 
 ## License
 
-Add your preferred license here, such as MIT, Apache-2.0, or internal-use only.
+internal-use only.
 
 Example:
 
