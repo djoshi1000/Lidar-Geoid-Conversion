@@ -14,23 +14,28 @@ import pandas as pd
 # ============================================================
 
 SOURCE_GEOID12B_FOLDER = Path(
-    r"C:\Users\Durga\Downloads\geoid\2018\Geoid\Tile"
+    r"C:\Users\Durga\Downloads\geoid\2018\New_test\Geoid_12"
 )
 
 EXISTING_GEOID99_FOLDER = Path(
-    r"C:\Users\Durga\Downloads\geoid\2018\Geoid99\Tile"
+    r"C:\Users\Durga\Downloads\geoid\2018\New_test\Geoid_99"
 )
 
 OUTPUT_GENERATED_GEOID99_FOLDER = Path(
-    r"C:\Users\Durga\Downloads\geoid\2018\Generated_Geoid99_FIXED_6588\Tile"
+    r"C:\Users\Durga\Downloads\geoid\2018\New_test\Generated_Geoid99_FIXED_6588"
 )
 
 OUTPUT_COMPARE_CSV = Path(
-    r"C:\Users\Durga\Downloads\geoid\2018\Generated_Geoid99_FIXED_6588\comparison_after_each_file.csv"
+    r"C:\Users\Durga\Downloads\geoid\2018\New_test\Generated_Geoid99_FIXED_6588\comparison_after_each_file.csv"
 )
 
+
+
+SOURCE_VERTICAL_UNITS_OVERRIDE = None
+TARGET_VERTICAL_UNITS_OVERRIDE = None
+
 # Process only first 2 files for testing
-MAX_FILES_TO_PROCESS = 8
+MAX_FILES_TO_PROCESS = 16
 
 # Source CRS: your GEOID12B LAS files
 SOURCE_HORIZONTAL_EPSG = "EPSG:26915"  # NAD83 / UTM zone 15N, meters
@@ -61,6 +66,91 @@ GRID_URLS = {
 for i in range(1, 9):
     grid = GRID_DIR / f"us_noaa_g1999u0{i}.tif"
     GRID_URLS[grid] = f"https://cdn.proj.org/us_noaa_g1999u0{i}.tif"
+
+
+
+
+def get_las_crs_object(las_file: Path):
+    """
+    Reads CRS directly from LAS/LAZ header.
+    """
+    with laspy.open(las_file, read_evlrs=True) as reader:
+        crs = reader.header.parse_crs()
+
+    if crs is None:
+        raise ValueError(f"No CRS found in LAS header: {las_file}")
+
+    return crs
+
+
+def get_horizontal_crs(crs):
+    """
+    If CRS is compound, use the horizontal/projected part.
+    Otherwise return the CRS itself.
+    """
+    try:
+        sub_crs_list = crs.sub_crs_list
+
+        if sub_crs_list:
+            for sub_crs in sub_crs_list:
+                if getattr(sub_crs, "is_projected", False) or getattr(sub_crs, "is_geographic", False):
+                    return sub_crs
+    except Exception:
+        pass
+
+    return crs
+
+
+def crs_to_pdal_horizontal_string(crs):
+    """
+    Convert CRS from LAS header into something PDAL/PROJ can use.
+    Prefer EPSG if available. Otherwise use PROJ string. Otherwise WKT.
+    """
+    horizontal_crs = get_horizontal_crs(crs)
+
+    try:
+        epsg = horizontal_crs.to_epsg()
+        if epsg is not None:
+            return f"+init=epsg:{epsg}"
+    except Exception:
+        pass
+
+    try:
+        proj4 = horizontal_crs.to_proj4()
+        if proj4:
+            return proj4
+    except Exception:
+        pass
+
+    return horizontal_crs.to_wkt()
+
+
+def infer_vertical_units_from_crs(crs):
+    """
+    Infer LAS Z units from CRS text.
+    For these datasets, LAS Z units usually follow the CRS linear units.
+    """
+    try:
+        text = (crs.name + " " + crs.to_wkt()).lower()
+    except Exception:
+        text = str(crs).lower()
+
+    if "us survey foot" in text or "ftus" in text or "foot_us" in text:
+        return "us-ft"
+
+    if "metre" in text or "meter" in text or "utm" in text:
+        return "m"
+
+    raise ValueError(
+        "Could not infer vertical units from CRS. "
+        "Set SOURCE_VERTICAL_UNITS_OVERRIDE manually to either 'm' or 'us-ft'."
+    )
+
+
+def get_point_count_simple(las_file: Path):
+    with laspy.open(las_file, read_evlrs=True) as reader:
+        return int(reader.header.point_count)
+
 
 
 def list_las_files(folder: Path):
@@ -111,25 +201,45 @@ def get_existing_geoid99_wkt(existing_file: Path):
         return crs.to_wkt()
 
 
-def convert_geoid12b_to_geoid99(source_file: Path, output_file: Path, target_wkt: str):
+def convert_geoid12b_to_geoid99(source_file: Path, existing_file: Path, output_file: Path):
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
     if output_file.exists():
         output_file.unlink()
 
+    source_crs = get_las_crs_object(source_file)
+    target_crs = get_las_crs_object(existing_file)
+
+    source_horizontal_srs = crs_to_pdal_horizontal_string(source_crs)
+    target_horizontal_srs = crs_to_pdal_horizontal_string(target_crs)
+
+    source_vunits = SOURCE_VERTICAL_UNITS_OVERRIDE or infer_vertical_units_from_crs(source_crs)
+    target_vunits = TARGET_VERTICAL_UNITS_OVERRIDE or infer_vertical_units_from_crs(target_crs)
+
+    target_wkt = target_crs.to_wkt()
+
     geoid99_grid_string = ",".join(g.as_posix() for g in GEOID99_GRIDS)
 
     source_srs = (
-        f"+init={SOURCE_HORIZONTAL_EPSG.lower()} "
-        f"+vunits=m "
+        f"{source_horizontal_srs} "
+        f"+vunits={source_vunits} "
         f"+geoidgrids={GEOID12B.as_posix()}"
     )
 
     target_srs = (
-        f"+init={TARGET_HORIZONTAL_EPSG.lower()} "
-        f"+vunits=us-ft "
+        f"{target_horizontal_srs} "
+        f"+vunits={target_vunits} "
         f"+geoidgrids={geoid99_grid_string}"
     )
+
+    print("Source CRS from header:")
+    print(" ", source_crs.name)
+    print("Target CRS from existing GEOID99:")
+    print(" ", target_crs.name)
+    print("Source SRS used by PDAL:")
+    print(" ", source_srs)
+    print("Target SRS used by PDAL:")
+    print(" ", target_srs)
 
     pipeline = {
         "pipeline": [
@@ -156,13 +266,34 @@ def convert_geoid12b_to_geoid99(source_file: Path, output_file: Path, target_wkt
         ]
     }
 
-    subprocess.run(
+    result = subprocess.run(
         [PDAL_EXE, "pipeline", "--stdin"],
         input=json.dumps(pipeline),
         text=True,
-        check=True
+        capture_output=True
     )
 
+    print("PDAL return code:", result.returncode)
+
+    if result.stdout:
+        print("PDAL STDOUT:")
+        print(result.stdout)
+
+    if result.stderr:
+        print("PDAL STDERR:")
+        print(result.stderr)
+
+    if result.returncode != 0:
+        raise RuntimeError("PDAL pipeline failed.")
+
+    generated_count = get_point_count_simple(output_file)
+
+    print("Generated point count:", generated_count)
+
+    if generated_count == 0:
+        raise ValueError(
+            f"Generated LAS has 0 points. Bad conversion output: {output_file}"
+        )
 
 def get_crs_name(las_file: Path):
     with laspy.open(las_file, read_evlrs=True) as reader:
@@ -302,10 +433,8 @@ def main():
         print("Existing GEOID99:", existing_file.name)
         print("Output:", output_file.name)
 
-        target_wkt = get_existing_geoid99_wkt(existing_file)
-
         print("Converting...")
-        convert_geoid12b_to_geoid99(source_file, output_file, target_wkt)
+        convert_geoid12b_to_geoid99(source_file, existing_file, output_file)
 
         print("Output CRS check:")
         print(" ", get_crs_name(output_file))
